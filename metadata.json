@@ -1,0 +1,6 @@
+{
+  "name": "Astral MODZ",
+  "description": "Astral MODZ – Best Free & Paid MLBB Utilities & Mod Services.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

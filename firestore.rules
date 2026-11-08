@@ -1,0 +1,25 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default catch-all deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidProduct(data) {
+      return data.title is string && data.title.size() <= 100
+        && data.category is string && data.category.size() <= 50
+        && data.downloadUrl is string && data.downloadUrl.size() <= 500
+        && data.priceType is string && data.priceType.size() <= 20
+        && data.createdAt is number;
+    }
+
+    // Products collection for Astral MODZ store
+    match /products/{productId} {
+      allow read: if true;
+      allow create, update: if isValidProduct(request.resource.data);
+      allow delete: if true;
+    }
+  }
+}

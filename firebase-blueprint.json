@@ -1,0 +1,30 @@
+{
+  "entities": {
+    "Product": {
+      "title": "Product",
+      "description": "Published app or utility in Astral MODZ store",
+      "type": "object",
+      "properties": {
+        "title": { "type": "string", "maxLength": 100 },
+        "category": { "type": "string", "maxLength": 50 },
+        "downloadUrl": { "type": "string", "maxLength": 500 },
+        "priceType": { "type": "string", "maxLength": 20 },
+        "version": { "type": "string", "maxLength": 30 },
+        "iconUrl": { "type": "string", "maxLength": 500000 },
+        "screenshots": {
+          "type": "array",
+          "items": { "type": "string", "maxLength": 500000 }
+        },
+        "description": { "type": "string", "maxLength": 5000 },
+        "createdAt": { "type": "number" }
+      },
+      "required": ["title", "category", "downloadUrl", "priceType", "createdAt"]
+    }
+  },
+  "firestore": {
+    "/products/{productId}": {
+      "schema": "Product",
+      "description": "Collection of published apps and utilities"
+    }
+  }
+}
