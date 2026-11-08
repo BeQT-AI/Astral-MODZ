@@ -21,5 +21,10 @@ service cloud.firestore {
       allow create, update: if isValidProduct(request.resource.data);
       allow delete: if true;
     }
+
+    // Site branding config in Firestore
+    match /site_config/{configId} {
+      allow read, write: if true;
+    }
   }
 }

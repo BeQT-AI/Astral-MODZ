@@ -8,6 +8,7 @@ import {
   onSnapshot 
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from './firebase';
+import { EMBEDDED_ASTRAL_LOGO, EMBEDDED_ASTRAL_BG } from './assetsData';
 import { 
   Download, 
   ExternalLink, 
@@ -117,6 +118,10 @@ const itemVariants: Variants = {
 export default function App() {
   const TELEGRAM_URL = 'https://t.me/NebulaFXsk';
   
+  // Site Assets (Synced with Firebase Firestore & embedded base64 Data URL fallback)
+  const [siteLogo, setSiteLogo] = useState<string>(EMBEDDED_ASTRAL_LOGO);
+  const [siteBg, setSiteBg] = useState<string>(EMBEDDED_ASTRAL_BG);
+  
   // Navigation State
   const [currentView, setCurrentView] = useState<'home' | 'store'>('home');
   
@@ -173,6 +178,29 @@ export default function App() {
     }, (error) => {
       handleFirestoreError(error, OperationType.LIST, 'products');
       setIsLoadingProducts(false);
+    });
+
+    return () => unsubscribe();
+  }, []);
+
+  // Real-time Firestore sync & auto-seeding for site branding assets
+  useEffect(() => {
+    const configDocRef = doc(db, 'site_config', 'branding');
+    const unsubscribe = onSnapshot(configDocRef, (docSnap) => {
+      if (docSnap.exists()) {
+        const data = docSnap.data();
+        if (data.logoUrl) setSiteLogo(data.logoUrl);
+        if (data.bgUrl) setSiteBg(data.bgUrl);
+      } else {
+        // Automatically upload and seed initial logo & bg base64 data to Firestore
+        setDoc(configDocRef, {
+          logoUrl: EMBEDDED_ASTRAL_LOGO,
+          bgUrl: EMBEDDED_ASTRAL_BG,
+          updatedAt: Date.now()
+        }).catch((err) => {
+          console.warn('Firestore branding seeding error:', err);
+        });
+      }
     });
 
     return () => unsubscribe();
@@ -381,8 +409,9 @@ export default function App() {
       {/* Background Orbital Asset */}
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
         <img 
-          src="/public/assets/aistudio/200w__1__9c33c230.webp" 
+          src={siteBg} 
           alt="" 
+          onError={(e) => { e.currentTarget.src = EMBEDDED_ASTRAL_BG; }}
           className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 w-full h-full object-cover opacity-10 mix-blend-screen scale-110"
         />
         <div className="absolute inset-0 bg-gradient-to-b from-[#050505] via-transparent to-[#050505]" />
@@ -397,13 +426,14 @@ export default function App() {
             className="flex items-center gap-3 shrink-0 text-left focus:outline-none group cursor-pointer"
           >
             <img 
-              src="/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg" 
+              src={siteLogo} 
               alt="Astral MODZ Logo" 
+              onError={(e) => { e.currentTarget.src = EMBEDDED_ASTRAL_LOGO; }}
               className="w-9 h-9 rounded-full object-cover border border-blue-500/20 shadow-[0_0_15px_rgba(37,99,235,0.2)] group-hover:scale-105 transition-transform cursor-pointer"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpandedImage({
-                  url: '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg',
+                  url: siteLogo,
                   title: 'Astral MODZ Logo'
                 });
               }}
@@ -507,10 +537,11 @@ export default function App() {
                   className="relative z-10"
                 >
                   <motion.div variants={itemVariants} className="flex justify-center mb-10">
-                    <div className="relative group cursor-pointer" onClick={() => setExpandedImage({ url: '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg', title: 'Astral MODZ Hero Logo' })}>
+                    <div className="relative group cursor-pointer" onClick={() => setExpandedImage({ url: siteLogo, title: 'Astral MODZ Hero Logo' })}>
                       <img 
-                        src="/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg" 
+                        src={siteLogo} 
                         alt="Astral MODZ Large Logo" 
+                        onError={(e) => { e.currentTarget.src = EMBEDDED_ASTRAL_LOGO; }}
                         className="w-36 h-36 md:w-48 md:h-48 rounded-3xl shadow-2xl shadow-blue-900/40 border border-white/5 group-hover:scale-105 transition-transform"
                       />
                       <div className="absolute inset-0 bg-black/40 rounded-3xl opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
@@ -761,7 +792,7 @@ export default function App() {
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                   {filteredProducts.map(product => {
-                    const iconSrc = product.iconUrl || '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg';
+                    const iconSrc = product.iconUrl || siteLogo;
                     return (
                       <motion.div 
                         key={product.id}
@@ -784,7 +815,7 @@ export default function App() {
                                   alt={product.title} 
                                   className="w-14 h-14 rounded-2xl object-cover border border-white/10 bg-blue-950/20 shadow-md group-hover/icon:scale-105 transition-transform"
                                   onError={(e) => {
-                                    (e.target as HTMLImageElement).src = '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg';
+                                    (e.target as HTMLImageElement).src = siteLogo;
                                   }}
                                 />
                                 <div className="absolute inset-0 bg-black/40 rounded-2xl opacity-0 group-hover/icon:opacity-100 transition-opacity flex items-center justify-center text-white">
@@ -1327,17 +1358,17 @@ export default function App() {
                 <div 
                   className="relative group/deticon cursor-pointer shrink-0" 
                   onClick={() => setExpandedImage({
-                    url: viewingProduct.iconUrl || '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg',
+                    url: viewingProduct.iconUrl || siteLogo,
                     title: viewingProduct.title + ' Logo'
                   })}
                   title="Click to expand icon"
                 >
                   <img 
-                    src={viewingProduct.iconUrl || '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg'} 
+                    src={viewingProduct.iconUrl || siteLogo} 
                     alt={viewingProduct.title} 
                     className="w-16 h-16 rounded-2xl object-cover border border-white/10 shadow-lg group-hover/deticon:scale-105 transition-transform"
                     onError={(e) => {
-                      (e.target as HTMLImageElement).src = '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg';
+                      (e.target as HTMLImageElement).src = siteLogo;
                     }}
                   />
                   <div className="absolute inset-0 bg-black/40 rounded-2xl opacity-0 group-hover/deticon:opacity-100 transition-opacity flex items-center justify-center text-white">
@@ -1549,10 +1580,11 @@ export default function App() {
         <div className="max-w-[1440px] mx-auto flex flex-col md:flex-row items-center justify-between gap-10">
           <div className="flex items-center gap-4">
             <img 
-              src="/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg" 
+              src={siteLogo} 
               alt="Astral MODZ Logo" 
+              onError={(e) => { e.currentTarget.src = EMBEDDED_ASTRAL_LOGO; }}
               className="w-8 h-8 rounded-full grayscale opacity-40 cursor-pointer"
-              onClick={() => setExpandedImage({ url: '/public/assets/aistudio/IMG_20261108_104011_773_9da4fd1b.jpg', title: 'Astral MODZ Footer Logo' })}
+              onClick={() => setExpandedImage({ url: siteLogo, title: 'Astral MODZ Footer Logo' })}
               title="Click to expand logo"
             />
             <span className="text-sm font-bold tracking-widest text-slate-500 uppercase">
