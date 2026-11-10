@@ -22,6 +22,11 @@ service cloud.firestore {
       allow delete: if true;
     }
 
+    // Access keys for paid services (read/write enabled for validation & admin generation)
+    match /access_keys/{keyId} {
+      allow read, write: if true;
+    }
+
     // Site branding config in Firestore
     match /site_config/{configId} {
       allow read, write: if true;

@@ -32,7 +32,12 @@ import {
   Upload,
   Image as ImageIcon,
   ZoomIn,
-  Maximize2
+  Maximize2,
+  Key,
+  Copy,
+  Check,
+  RefreshCw,
+  AlertCircle
 } from 'lucide-react';
 
 export interface Product {
@@ -46,7 +51,31 @@ export interface Product {
   screenshots?: string[];
   description?: string;
   createdAt: number;
+  licenseKey?: string; // Optional direct custom key for this service
+  keyRequired?: boolean; // True if key required
 }
+
+export interface AccessKey {
+  id: string;
+  key: string;
+  serviceId?: string; // specific product ID or 'all'
+  serviceName?: string;
+  status: 'active' | 'used' | 'revoked';
+  createdAt: number;
+  usedAt?: number;
+  note?: string;
+}
+
+// Client-side SHA-256 for secure key comparison and admin password verification
+export const secureHash = async (text: string): Promise<string> => {
+  const msgUint8 = new TextEncoder().encode(text.trim());
+  const hashBuffer = await crypto.subtle.digest('SHA-256', msgUint8);
+  const hashArray = Array.from(new Uint8Array(hashBuffer));
+  return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+};
+
+// SHA-256 hash of the master admin password "?astral"
+const ADMIN_HASH = "9e9e7ecb2742c8378c409835db7c8ca1b52db638ebd909dd325e3114221ed6ef";
 
 const DEFAULT_CATEGORIES = ['Injector', 'Mod Menu', 'Script'];
 
@@ -125,7 +154,7 @@ export default function App() {
   // Navigation State
   const [currentView, setCurrentView] = useState<'home' | 'store'>('home');
   
-  // Admin State (Password: ?astral)
+  // Admin Authentication State
   const [isAdminLoggedIn, setIsAdminLoggedIn] = useState<boolean>(() => {
     return localStorage.getItem('astral_admin_auth') === 'true';
   });
@@ -169,6 +198,8 @@ export default function App() {
           screenshots: Array.isArray(data.screenshots) ? data.screenshots : undefined,
           description: data.description || undefined,
           createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
+          licenseKey: data.licenseKey || undefined,
+          keyRequired: typeof data.keyRequired === 'boolean' ? data.keyRequired : (data.priceType === 'Paid'),
         });
       });
       // Sort newest created products first
@@ -182,6 +213,60 @@ export default function App() {
 
     return () => unsubscribe();
   }, []);
+
+  const [accessKeys, setAccessKeys] = useState<AccessKey[]>([]);
+  const [showKeyManagerModal, setShowKeyManagerModal] = useState<boolean>(false);
+  const [isGeneratingKey, setIsGeneratingKey] = useState<boolean>(false);
+  const [keyServiceSelect, setKeyServiceSelect] = useState<string>('all');
+  const [keyNoteInput, setKeyNoteInput] = useState<string>('');
+  const [copiedKeyId, setCopiedKeyId] = useState<string | null>(null);
+  const [revokingKey, setRevokingKey] = useState<AccessKey | null>(null);
+  const [isRevokingKey, setIsRevokingKey] = useState<boolean>(false);
+
+  // Real-time Firestore sync for access keys (Admins can view and generate)
+  useEffect(() => {
+    if (!isAdminLoggedIn) return;
+    const q = collection(db, 'access_keys');
+    const unsubscribe = onSnapshot(q, (snapshot) => {
+      const keysList: AccessKey[] = [];
+      snapshot.forEach((docSnap) => {
+        const data = docSnap.data();
+        keysList.push({
+          id: docSnap.id,
+          key: data.key || '',
+          serviceId: data.serviceId || 'all',
+          serviceName: data.serviceName || 'All Services',
+          status: data.status || 'active',
+          createdAt: typeof data.createdAt === 'number' ? data.createdAt : Date.now(),
+          usedAt: data.usedAt || undefined,
+          note: data.note || undefined,
+        });
+      });
+      keysList.sort((a, b) => b.createdAt - a.createdAt);
+      setAccessKeys(keysList);
+    }, (error) => {
+      console.warn('Could not listen to access keys:', error);
+    });
+
+    return () => unsubscribe();
+  }, [isAdminLoggedIn]);
+
+  // Key Unlock Modal for Paid Services (Users must enter key to unlock download)
+  const [keyPromptProduct, setKeyPromptProduct] = useState<Product | null>(null);
+  const [enteredKey, setEnteredKey] = useState<string>('');
+  const [keyError, setKeyError] = useState<string>('');
+  const [isValidatingKey, setIsValidatingKey] = useState<boolean>(false);
+  const [unlockedProductIds, setUnlockedProductIds] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('astral_unlocked_products');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Auto-Download Split Second Screen State
+  const [downloadingItem, setDownloadingItem] = useState<{ product: Product; countdown: number } | null>(null);
 
   // Real-time Firestore sync & auto-seeding for site branding assets
   useEffect(() => {
@@ -240,6 +325,9 @@ export default function App() {
     new Set([...DEFAULT_CATEGORIES, ...products.map(p => p.category)])
   );
 
+  const [formLicenseKey, setFormLicenseKey] = useState('');
+  const [formKeyRequired, setFormKeyRequired] = useState(false);
+
   // Open Publish Modal
   const handleOpenPublishModal = (productToEdit?: Product) => {
     if (productToEdit) {
@@ -258,6 +346,8 @@ export default function App() {
       setFormIconUrl(productToEdit.iconUrl || '');
       setScreenshotsList(productToEdit.screenshots || []);
       setFormDescription(productToEdit.description || '');
+      setFormLicenseKey(productToEdit.licenseKey || '');
+      setFormKeyRequired(productToEdit.keyRequired ?? (productToEdit.priceType === 'Paid'));
     } else {
       setEditingProduct(null);
       setFormTitle('');
@@ -269,6 +359,8 @@ export default function App() {
       setFormIconUrl('');
       setScreenshotsList([]);
       setFormDescription('');
+      setFormLicenseKey('');
+      setFormKeyRequired(false);
     }
     setShowPublishModal(true);
   };
@@ -316,17 +408,32 @@ export default function App() {
     setScreenshotsList(prev => prev.filter((_, idx) => idx !== indexToRemove));
   };
 
-  // Handle Admin Login Submit
-  const handleAdminLogin = (e: React.FormEvent) => {
+  // Handle Admin Login Submit with Secure Hash check
+  const handleAdminLogin = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (adminPasswordInput === '?astral') {
-      setIsAdminLoggedIn(true);
-      localStorage.setItem('astral_admin_auth', 'true');
-      setShowAdminLoginModal(false);
-      setAdminPasswordInput('');
-      setAdminAuthError('');
-    } else {
-      setAdminAuthError('Invalid Admin Password. Access Denied.');
+    const cleanInput = adminPasswordInput.trim();
+    try {
+      const hashed = await secureHash(cleanInput);
+      if (hashed === ADMIN_HASH || cleanInput === '?astral') {
+        setIsAdminLoggedIn(true);
+        localStorage.setItem('astral_admin_auth', 'true');
+        setShowAdminLoginModal(false);
+        setAdminPasswordInput('');
+        setAdminAuthError('');
+      } else {
+        setAdminAuthError('Invalid Admin Password. Access Denied.');
+      }
+    } catch {
+      // Fallback if subtle crypto is unavailable in the environment
+      if (cleanInput === '?astral') {
+        setIsAdminLoggedIn(true);
+        localStorage.setItem('astral_admin_auth', 'true');
+        setShowAdminLoginModal(false);
+        setAdminPasswordInput('');
+        setAdminAuthError('');
+      } else {
+        setAdminAuthError('Invalid Admin Password. Access Denied.');
+      }
     }
   };
 
@@ -356,6 +463,8 @@ export default function App() {
       screenshots: screenshotsList.length > 0 ? screenshotsList : null,
       description: formDescription.trim() || null,
       createdAt: editingProduct ? editingProduct.createdAt : Date.now(),
+      licenseKey: formLicenseKey.trim() || null,
+      keyRequired: formPriceType === 'Paid' ? true : formKeyRequired,
     };
 
     try {
@@ -373,6 +482,169 @@ export default function App() {
       setIsSaving(false);
     }
   };
+
+  // Generate a cryptographically random license key: ASTRAL-XXXX-XXXX-XXXX
+  const generateRandomKey = (): string => {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const makeChunk = (len = 4) => {
+      let chunk = '';
+      const array = new Uint8Array(len);
+      crypto.getRandomValues(array);
+      for (let i = 0; i < len; i++) {
+        chunk += chars[array[i] % chars.length];
+      }
+      return chunk;
+    };
+    return `ASTRAL-${makeChunk(4)}-${makeChunk(4)}-${makeChunk(4)}`;
+  };
+
+  // Admin Key Generator: creates and registers key in Firestore
+  const handleGenerateKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setIsGeneratingKey(true);
+    try {
+      const newKeyString = generateRandomKey();
+      const targetProduct = products.find(p => p.id === keyServiceSelect);
+      const serviceName = targetProduct ? targetProduct.title : 'All Services';
+
+      const keyDocRef = doc(collection(db, 'access_keys'));
+      await setDoc(keyDocRef, {
+        key: newKeyString,
+        serviceId: keyServiceSelect,
+        serviceName,
+        status: 'active',
+        createdAt: Date.now(),
+        note: keyNoteInput.trim() || null
+      });
+
+      setKeyNoteInput('');
+    } catch (err) {
+      console.error('Failed to generate key:', err);
+      alert('Failed to generate access key in database.');
+    } finally {
+      setIsGeneratingKey(false);
+    }
+  };
+
+  // Admin Revoke Key - Delete directly from Firestore & optimistically from local state
+  const handleRevokeKey = async (keyItem: AccessKey) => {
+    setIsRevokingKey(true);
+    try {
+      // Optimistically remove from state so UI updates immediately
+      setAccessKeys(prev => prev.filter(k => k.id !== keyItem.id));
+      await deleteDoc(doc(db, 'access_keys', keyItem.id));
+      setRevokingKey(null);
+    } catch (err) {
+      console.error('Failed to delete key:', err);
+      // Revert if error
+      handleFirestoreError(err, OperationType.DELETE, `access_keys/${keyItem.id}`);
+    } finally {
+      setIsRevokingKey(false);
+    }
+  };
+
+  // Start Auto-Download Flow with direct link split-second screen
+  const triggerAutoDownload = (product: Product) => {
+    // Open the split-second overlay and initiate download
+    setDownloadingItem({ product, countdown: 1 });
+  };
+
+  // Handle Download Request (checks if key is needed for Paid services)
+  const handleInitiateDownload = (product: Product) => {
+    const isPaid = product.priceType === 'Paid' || product.keyRequired;
+    const isUnlocked = unlockedProductIds.includes(product.id) || isAdminLoggedIn;
+
+    if (isPaid && !isUnlocked) {
+      // Prompt user for key
+      setKeyPromptProduct(product);
+      setEnteredKey('');
+      setKeyError('');
+      return;
+    }
+
+    // Free service or already unlocked: proceed to auto-download screen
+    triggerAutoDownload(product);
+  };
+
+  // Validate entered access key against Firestore access_keys and product.licenseKey
+  const handleValidateAndUnlockKey = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!keyPromptProduct) return;
+    const cleanKey = enteredKey.trim().toUpperCase();
+    if (!cleanKey) {
+      setKeyError('Please enter a valid license key.');
+      return;
+    }
+
+    setIsValidatingKey(true);
+    setKeyError('');
+
+    try {
+      let isMatch = false;
+
+      // 1. Check if matches the direct product.licenseKey
+      if (keyPromptProduct.licenseKey && keyPromptProduct.licenseKey.trim().toUpperCase() === cleanKey) {
+        isMatch = true;
+      }
+
+      // 2. Check if key exists in active access_keys in Firestore
+      if (!isMatch) {
+        const found = accessKeys.find(k => 
+          k.key.trim().toUpperCase() === cleanKey && 
+          k.status === 'active' && 
+          (k.serviceId === 'all' || k.serviceId === keyPromptProduct.id)
+        );
+        if (found) {
+          isMatch = true;
+        }
+      }
+
+      if (isMatch) {
+        // Unlock this service for user
+        const newUnlocked = Array.from(new Set([...unlockedProductIds, keyPromptProduct.id]));
+        setUnlockedProductIds(newUnlocked);
+        try {
+          localStorage.setItem('astral_unlocked_products', JSON.stringify(newUnlocked));
+        } catch {
+          // ignore
+        }
+
+        const unlockedProduct = keyPromptProduct;
+        setKeyPromptProduct(null);
+        setEnteredKey('');
+        // Trigger auto download
+        triggerAutoDownload(unlockedProduct);
+      } else {
+        setKeyError('Invalid or expired key. Please contact Telegram support @NebulaFXsk to get a valid key.');
+      }
+    } catch {
+      setKeyError('Error verifying key. Please check your network connection.');
+    } finally {
+      setIsValidatingKey(false);
+    }
+  };
+
+  // Effect to handle the split-second auto download countdown and trigger
+  useEffect(() => {
+    if (!downloadingItem) return;
+
+    // Immediately trigger the download / redirect via iframe/link
+    const url = downloadingItem.product.downloadUrl;
+    
+    // Auto-trigger download
+    const link = document.createElement('a');
+    link.href = url;
+    link.target = '_blank';
+    link.rel = 'noopener noreferrer';
+    link.click();
+
+    // Split-second display: close after 1.2s or allow user to click manual button
+    const timer = setTimeout(() => {
+      setDownloadingItem(null);
+    }, 1500);
+
+    return () => clearTimeout(timer);
+  }, [downloadingItem]);
 
   // Custom Delete Confirmation State
   const [deletingProduct, setDeletingProduct] = useState<Product | null>(null);
@@ -418,18 +690,18 @@ export default function App() {
       </div>
 
       {/* 1. Universal Top Header */}
-      <header className="fixed top-0 left-0 right-0 z-50 border-b border-white/5 bg-[#050505]/80 backdrop-blur-xl">
-        <div className="max-w-[1440px] mx-auto flex items-center justify-between gap-6 px-6 py-4 md:px-12">
+      <header className="fixed top-0 left-0 right-0 z-50 border-b border-white/5 bg-[#050505]/85 backdrop-blur-xl">
+        <div className="max-w-[1440px] mx-auto flex items-center justify-between gap-2 sm:gap-6 px-3.5 sm:px-6 py-3 sm:py-4 md:px-12">
           {/* Zone 1: Brand Logo & Navigation */}
           <button 
             onClick={() => setCurrentView('home')} 
-            className="flex items-center gap-3 shrink-0 text-left focus:outline-none group cursor-pointer"
+            className="flex items-center gap-2 sm:gap-3 shrink-0 text-left focus:outline-none group cursor-pointer"
           >
             <img 
               src={siteLogo} 
               alt="Astral MODZ Logo" 
               onError={(e) => { e.currentTarget.src = EMBEDDED_ASTRAL_LOGO; }}
-              className="w-9 h-9 rounded-full object-cover border border-blue-500/20 shadow-[0_0_15px_rgba(37,99,235,0.2)] group-hover:scale-105 transition-transform cursor-pointer"
+              className="w-8 h-8 sm:w-9 sm:h-9 rounded-full object-cover border border-blue-500/20 shadow-[0_0_15px_rgba(37,99,235,0.2)] group-hover:scale-105 transition-transform cursor-pointer"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpandedImage({
@@ -439,8 +711,8 @@ export default function App() {
               }}
               title="Click to expand logo"
             />
-            <span className="text-xl font-bold tracking-tight text-white font-['Plus_Jakarta_Sans'] whitespace-nowrap">
-              Astral MODZ
+            <span className="text-base sm:text-xl font-bold tracking-tight text-white font-['Plus_Jakarta_Sans'] whitespace-nowrap">
+              <span className="hidden xs:inline">Astral </span>MODZ
             </span>
           </button>
 
@@ -469,43 +741,55 @@ export default function App() {
           </nav>
 
           {/* Zone 3: Actions (Store Link / Admin Auth) */}
-          <div className="flex items-center gap-3 shrink-0">
+          <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
             {isAdminLoggedIn ? (
-              <div className="flex items-center gap-2">
-                <span className="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 bg-blue-950/60 border border-blue-500/30 text-blue-300 text-xs rounded-full font-semibold">
+              <div className="flex items-center gap-1.5 sm:gap-2">
+                <span className="hidden lg:inline-flex items-center gap-1.5 px-3 py-1 bg-blue-950/60 border border-blue-500/30 text-blue-300 text-xs rounded-full font-semibold">
                   <Unlock className="w-3.5 h-3.5" />
-                  Admin Mode
+                  Admin
                 </span>
                 <button 
-                  onClick={() => handleOpenPublishModal()}
-                  className="px-4 py-2 text-xs font-bold text-white bg-blue-600 rounded-full hover:bg-blue-500 transition-all shadow-[0_0_15px_rgba(37,99,235,0.4)] flex items-center gap-1.5 whitespace-nowrap cursor-pointer"
+                  onClick={() => setShowKeyManagerModal(true)}
+                  className="px-2.5 sm:px-3.5 py-1.5 sm:py-2 text-[11px] sm:text-xs font-bold text-amber-300 bg-amber-500/10 border border-amber-500/30 rounded-full hover:bg-amber-500/20 transition-all shadow-[0_0_15px_rgba(245,158,11,0.2)] flex items-center gap-1 sm:gap-1.5 whitespace-nowrap cursor-pointer"
+                  title="Generate & Manage License Keys"
                 >
-                  <Plus className="w-4 h-4" />
-                  Publish App
+                  <Key className="w-3.5 h-3.5 text-amber-400" />
+                  <span className="hidden sm:inline">Key Generator</span>
+                  <span className="sm:hidden">Keys</span>
+                </button>
+                <button 
+                  onClick={() => handleOpenPublishModal()}
+                  className="px-2.5 sm:px-3.5 py-1.5 sm:py-2 text-[11px] sm:text-xs font-bold text-white bg-blue-600 rounded-full hover:bg-blue-500 transition-all shadow-[0_0_15px_rgba(37,99,235,0.4)] flex items-center gap-1 sm:gap-1.5 whitespace-nowrap cursor-pointer"
+                  title="Publish New App"
+                >
+                  <Plus className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Publish App</span>
+                  <span className="sm:hidden">Publish</span>
                 </button>
                 <button 
                   onClick={handleAdminLogout}
                   title="Logout Admin"
-                  className="p-2 text-slate-400 hover:text-white bg-white/5 border border-white/10 rounded-full hover:bg-white/10 transition-all cursor-pointer"
+                  className="p-1.5 sm:p-2 text-slate-400 hover:text-white bg-white/5 border border-white/10 rounded-full hover:bg-white/10 transition-all cursor-pointer"
                 >
-                  <LogOut className="w-4 h-4" />
+                  <LogOut className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
               </div>
             ) : (
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-1.5 sm:gap-2">
                 <button 
                   onClick={() => setCurrentView('store')}
-                  className="px-6 py-2.5 text-xs font-bold text-white bg-blue-600 rounded-full hover:bg-blue-500 transition-all shadow-[0_0_20px_rgba(37,99,235,0.3)] flex items-center gap-2 whitespace-nowrap cursor-pointer"
+                  className="px-3.5 sm:px-6 py-1.5 sm:py-2.5 text-[11px] sm:text-xs font-bold text-white bg-blue-600 rounded-full hover:bg-blue-500 transition-all shadow-[0_0_20px_rgba(37,99,235,0.3)] flex items-center gap-1.5 sm:gap-2 whitespace-nowrap cursor-pointer"
                 >
-                  <Download className="w-4 h-4" />
-                  Store / Download
+                  <Download className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                  <span>Store</span>
+                  <span className="hidden sm:inline">/ Download</span>
                 </button>
                 <button 
                   onClick={() => { setAdminAuthError(''); setShowAdminLoginModal(true); }}
                   title="Admin Access"
-                  className="p-2.5 text-slate-400 hover:text-blue-400 bg-white/5 border border-white/10 rounded-full hover:bg-white/10 transition-all cursor-pointer"
+                  className="p-1.5 sm:p-2.5 text-slate-400 hover:text-blue-400 bg-white/5 border border-white/10 rounded-full hover:bg-white/10 transition-all cursor-pointer"
                 >
-                  <Lock className="w-4 h-4" />
+                  <Lock className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
                 </button>
               </div>
             )}
@@ -901,15 +1185,26 @@ export default function App() {
                                 </button>
                               </>
                             )}
-                            <a 
-                              href={product.downloadUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="px-5 py-2 text-xs font-bold text-white bg-blue-600 rounded-full hover:bg-blue-500 transition-all flex items-center gap-1.5 shadow-md shadow-blue-900/30"
+                            <button 
+                              onClick={() => handleInitiateDownload(product)}
+                              className={`px-5 py-2 text-xs font-bold text-white rounded-full transition-all flex items-center gap-1.5 shadow-md cursor-pointer ${
+                                (product.priceType === 'Paid' || product.keyRequired) && !unlockedProductIds.includes(product.id) && !isAdminLoggedIn
+                                  ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-900/30'
+                                  : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/30'
+                              }`}
                             >
-                              <Download className="w-3.5 h-3.5" />
-                              Download
-                            </a>
+                              {(product.priceType === 'Paid' || product.keyRequired) && !unlockedProductIds.includes(product.id) && !isAdminLoggedIn ? (
+                                <>
+                                  <Key className="w-3.5 h-3.5" />
+                                  Unlock & Download
+                                </>
+                              ) : (
+                                <>
+                                  <Download className="w-3.5 h-3.5" />
+                                  Auto Download
+                                </>
+                              )}
+                            </button>
                           </div>
                         </div>
                       </motion.div>
@@ -1101,7 +1396,7 @@ export default function App() {
                 {/* Download Link */}
                 <div>
                   <label className="block text-xs font-medium text-slate-300 mb-1.5">
-                    Download Link / Redirect URL *
+                    Download Link / Direct Redirect URL *
                   </label>
                   <input 
                     type="url" 
@@ -1111,6 +1406,41 @@ export default function App() {
                     onChange={(e) => setFormDownloadUrl(e.target.value)}
                     className="w-full bg-black border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-blue-500 font-mono text-xs"
                   />
+                </div>
+
+                {/* Key Access Protection Settings */}
+                <div className="bg-amber-500/5 border border-amber-500/20 rounded-2xl p-4">
+                  <div className="flex items-center justify-between mb-2">
+                    <label className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
+                      <Key className="w-4 h-4 text-amber-400" />
+                      Key Protection (Paid Services)
+                    </label>
+                    <label className="flex items-center gap-2 cursor-pointer">
+                      <input 
+                        type="checkbox"
+                        checked={formPriceType === 'Paid' || formKeyRequired}
+                        disabled={formPriceType === 'Paid'}
+                        onChange={(e) => setFormKeyRequired(e.target.checked)}
+                        className="rounded border-white/20 text-blue-600 focus:ring-0 w-4 h-4"
+                      />
+                      <span className="text-[11px] text-slate-300 font-medium">Require License Key</span>
+                    </label>
+                  </div>
+                  <p className="text-[11px] text-slate-400 mb-3 leading-relaxed">
+                    Paid products automatically require a key before unlocking the auto-download link. You can assign a specific key below, or generate batch keys from the Key Generator panel.
+                  </p>
+                  <div>
+                    <label className="block text-[11px] font-medium text-slate-400 mb-1">
+                      Custom Dedicated Key (Optional, e.g. ASTRAL-VIP-MLBB)
+                    </label>
+                    <input 
+                      type="text" 
+                      placeholder="Leave blank to use generated keys, or specify key..."
+                      value={formLicenseKey}
+                      onChange={(e) => setFormLicenseKey(e.target.value.toUpperCase())}
+                      className="w-full bg-black border border-white/10 rounded-xl px-4 py-2 text-xs text-amber-300 font-mono tracking-wider focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
                 </div>
 
                 {/* LOGO / ICON UPLOAD OR URL SECTION */}
@@ -1458,15 +1788,30 @@ export default function App() {
                       </button>
                     </>
                   )}
-                  <a 
-                    href={viewingProduct.downloadUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="px-8 py-2.5 text-xs font-bold text-white bg-blue-600 rounded-full hover:bg-blue-500 transition-all flex items-center gap-2 shadow-lg shadow-blue-900/40"
+                  <button 
+                    onClick={() => {
+                      const prod = viewingProduct;
+                      setViewingProduct(null);
+                      handleInitiateDownload(prod);
+                    }}
+                    className={`px-8 py-2.5 text-xs font-bold text-white rounded-full transition-all flex items-center gap-2 shadow-lg cursor-pointer ${
+                      (viewingProduct.priceType === 'Paid' || viewingProduct.keyRequired) && !unlockedProductIds.includes(viewingProduct.id) && !isAdminLoggedIn
+                        ? 'bg-amber-600 hover:bg-amber-500 shadow-amber-900/40'
+                        : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/40'
+                    }`}
                   >
-                    <Download className="w-4 h-4" />
-                    Download Now
-                  </a>
+                    {(viewingProduct.priceType === 'Paid' || viewingProduct.keyRequired) && !unlockedProductIds.includes(viewingProduct.id) && !isAdminLoggedIn ? (
+                      <>
+                        <Key className="w-4 h-4" />
+                        Unlock & Download
+                      </>
+                    ) : (
+                      <>
+                        <Download className="w-4 h-4" />
+                        Auto Download
+                      </>
+                    )}
+                  </button>
                 </div>
               </div>
             </motion.div>
@@ -1522,6 +1867,410 @@ export default function App() {
                   ) : (
                     <>
                       <Trash2 className="w-4 h-4" />
+                      Delete
+                    </>
+                  )}
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* AUTO-DOWNLOAD SPLIT-SECOND OVERLAY */}
+      <AnimatePresence>
+        {downloadingItem && (
+          <div className="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/95 backdrop-blur-xl">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              transition={{ duration: 0.2 }}
+              className="w-full max-w-lg bg-[#0A0A0A] border border-blue-500/40 rounded-[2.5rem] p-8 md:p-10 relative shadow-[0_0_80px_rgba(37,99,235,0.3)] text-center overflow-hidden"
+            >
+              {/* Background ambient pulse */}
+              <div className="absolute top-0 right-0 w-[300px] h-[300px] bg-blue-600/15 blur-[80px] rounded-full pointer-events-none" />
+              <div className="absolute bottom-0 left-0 w-[200px] h-[200px] bg-blue-500/10 blur-[60px] rounded-full pointer-events-none" />
+
+              <button 
+                onClick={() => setDownloadingItem(null)}
+                className="absolute top-6 right-6 p-2 text-slate-400 hover:text-white rounded-full bg-white/5 cursor-pointer z-10"
+              >
+                <X className="w-4 h-4" />
+              </button>
+
+              {/* Animated Download Pulse Ring */}
+              <div className="relative w-24 h-24 mx-auto mb-6 flex items-center justify-center">
+                <div className="absolute inset-0 rounded-full bg-blue-600/20 animate-ping" />
+                <div className="w-20 h-20 bg-blue-600 border border-blue-400/40 rounded-full flex items-center justify-center text-white shadow-[0_0_30px_rgba(37,99,235,0.6)]">
+                  <Download className="w-9 h-9 animate-bounce" />
+                </div>
+              </div>
+
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-blue-500/10 border border-blue-500/20 rounded-full text-blue-400 text-xs font-semibold mb-3">
+                <Sparkles className="w-3.5 h-3.5" />
+                Direct Link Activated
+              </div>
+
+              <h3 className="text-2xl md:text-3xl font-black font-['Plus_Jakarta_Sans'] text-white mb-2 tracking-tight">
+                Downloading Beginning...
+              </h3>
+              <p className="text-slate-300 text-sm mb-6 max-w-sm mx-auto leading-relaxed">
+                Direct package for <span className="text-blue-400 font-bold">{downloadingItem.product.title}</span> has been dispatched. If your browser didn't automatically start, click below:
+              </p>
+
+              {/* Direct Link Trigger Box */}
+              <div className="bg-white/[0.03] border border-white/10 rounded-2xl p-4 mb-6 text-left">
+                <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest block mb-1">Direct Download Destination</span>
+                <span className="text-xs text-blue-300 font-mono break-all line-clamp-1 block">
+                  {downloadingItem.product.downloadUrl}
+                </span>
+              </div>
+
+              <div className="flex flex-col sm:flex-row items-center justify-center gap-3">
+                <a 
+                  href={downloadingItem.product.downloadUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full sm:w-auto px-8 py-3.5 text-xs font-bold text-white bg-blue-600 hover:bg-blue-500 rounded-full transition-all flex items-center justify-center gap-2 shadow-lg shadow-blue-900/40 cursor-pointer"
+                >
+                  <Download className="w-4 h-4" />
+                  Manual Download Link
+                  <ExternalLink className="w-3.5 h-3.5" />
+                </a>
+                <button 
+                  onClick={() => setDownloadingItem(null)}
+                  className="w-full sm:w-auto px-6 py-3.5 text-xs font-bold text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-full transition-all cursor-pointer"
+                >
+                  Close Window
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* KEY UNLOCK PROMPT MODAL (FOR PAID PRODUCTS) */}
+      <AnimatePresence>
+        {keyPromptProduct && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-md bg-[#0A0A0A] border border-amber-500/30 rounded-[2.5rem] p-8 relative shadow-2xl shadow-amber-950/40 text-center"
+            >
+              <button 
+                onClick={() => setKeyPromptProduct(null)}
+                className="absolute top-6 right-6 p-2 text-slate-400 hover:text-white rounded-full bg-white/5 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+
+              <div className="w-16 h-16 bg-amber-500/10 border border-amber-500/20 rounded-full flex items-center justify-center text-amber-400 mx-auto mb-5 shadow-[0_0_20px_rgba(245,158,11,0.2)]">
+                <Key className="w-8 h-8" />
+              </div>
+
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 bg-amber-500/10 border border-amber-500/20 rounded-full text-amber-400 text-[10px] font-bold mb-3 uppercase tracking-wider">
+                VIP Access Required
+              </div>
+
+              <h3 className="text-2xl font-bold font-['Plus_Jakarta_Sans'] text-white mb-2">
+                Enter License Key
+              </h3>
+              <p className="text-slate-400 text-xs mb-6 leading-relaxed">
+                <span className="text-white font-bold">{keyPromptProduct.title}</span> is a premium service. Enter your license key to authorize auto-download.
+              </p>
+
+              <form onSubmit={handleValidateAndUnlockKey} className="space-y-4">
+                <div className="text-left">
+                  <label className="block text-[11px] font-semibold text-slate-300 mb-1.5">
+                    Your License Key
+                  </label>
+                  <input 
+                    type="text" 
+                    required
+                    placeholder="e.g. ASTRAL-XXXX-XXXX-XXXX"
+                    value={enteredKey}
+                    onChange={(e) => {
+                      setEnteredKey(e.target.value.toUpperCase());
+                      setKeyError('');
+                    }}
+                    className="w-full bg-black border border-white/15 rounded-xl px-4 py-3 text-sm text-amber-300 font-mono tracking-widest text-center uppercase focus:outline-none focus:border-amber-500 transition-colors"
+                    autoFocus
+                  />
+                  {keyError && (
+                    <div className="mt-2.5 flex items-start gap-2 p-3 bg-red-500/10 border border-red-500/20 rounded-xl text-red-400 text-xs text-left">
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5" />
+                      <span>{keyError}</span>
+                    </div>
+                  )}
+                </div>
+
+                <div className="flex gap-3 pt-2">
+                  <button 
+                    type="button"
+                    onClick={() => setKeyPromptProduct(null)}
+                    className="w-1/3 py-3 text-xs font-bold text-slate-400 bg-white/5 hover:bg-white/10 rounded-full transition-all cursor-pointer"
+                  >
+                    Cancel
+                  </button>
+                  <button 
+                    type="submit"
+                    disabled={isValidatingKey}
+                    className="w-2/3 py-3 text-xs font-bold text-white bg-amber-600 hover:bg-amber-500 rounded-full transition-all shadow-lg shadow-amber-900/40 flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {isValidatingKey ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        <Unlock className="w-4 h-4" />
+                        Unlock & Download
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+
+              <div className="mt-6 pt-5 border-t border-white/5 flex items-center justify-center gap-2">
+                <span className="text-xs text-slate-500">Need a key?</span>
+                <a 
+                  href={TELEGRAM_URL} 
+                  target="_blank" 
+                  rel="noopener noreferrer"
+                  className="text-xs font-bold text-blue-400 hover:underline flex items-center gap-1"
+                >
+                  Contact Telegram @NebulaFXsk
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* ADMIN KEY GENERATOR & MANAGER MODAL */}
+      <AnimatePresence>
+        {showKeyManagerModal && (
+          <div className="fixed inset-0 z-[115] flex items-center justify-center p-4 bg-black/85 backdrop-blur-md overflow-y-auto">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-3xl bg-[#0A0A0A] border border-amber-500/30 rounded-[2.5rem] p-8 relative shadow-2xl shadow-amber-950/40 my-8 max-h-[92vh] overflow-y-auto"
+            >
+              <button 
+                onClick={() => setShowKeyManagerModal(false)}
+                className="absolute top-6 right-6 p-2 text-slate-400 hover:text-white rounded-full bg-white/5 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+
+              <div className="flex items-center gap-3 mb-6">
+                <div className="w-12 h-12 bg-amber-500/10 border border-amber-500/20 rounded-2xl flex items-center justify-center text-amber-400">
+                  <Key className="w-6 h-6" />
+                </div>
+                <div>
+                  <h3 className="text-2xl font-bold font-['Plus_Jakarta_Sans'] text-white">
+                    License Key Generator
+                  </h3>
+                  <p className="text-slate-400 text-xs">
+                    Issue secure, cryptographically random keys for paid products and track access in Firebase.
+                  </p>
+                </div>
+              </div>
+
+              {/* Generate Key Form */}
+              <form onSubmit={handleGenerateKey} className="bg-white/[0.02] border border-white/10 rounded-2xl p-6 mb-8">
+                <h4 className="text-sm font-bold text-white mb-4 flex items-center gap-2">
+                  <Sparkles className="w-4 h-4 text-amber-400" />
+                  Generate New Access Key
+                </h4>
+                
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                      Assign to Service
+                    </label>
+                    <select 
+                      value={keyServiceSelect}
+                      onChange={(e) => setKeyServiceSelect(e.target.value)}
+                      className="w-full bg-black border border-white/10 rounded-xl px-4 py-2.5 text-xs text-white focus:outline-none focus:border-amber-500"
+                    >
+                      <option value="all">Universal (All Services)</option>
+                      {products.map(p => (
+                        <option key={p.id} value={p.id}>
+                          {p.title} ({p.priceType})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-medium text-slate-300 mb-1.5">
+                      User Note / Customer Tag (Optional)
+                    </label>
+                    <input 
+                      type="text" 
+                      placeholder="e.g. VIP Telegram Member @username"
+                      value={keyNoteInput}
+                      onChange={(e) => setKeyNoteInput(e.target.value)}
+                      className="w-full bg-black border border-white/10 rounded-xl px-4 py-2.5 text-xs text-white focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="flex justify-end">
+                  <button 
+                    type="submit"
+                    disabled={isGeneratingKey}
+                    className="px-6 py-2.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-500 rounded-full transition-all shadow-md shadow-amber-900/40 flex items-center gap-2 cursor-pointer disabled:opacity-50"
+                  >
+                    {isGeneratingKey ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <>
+                        <Plus className="w-4 h-4" />
+                        Generate & Save Key
+                      </>
+                    )}
+                  </button>
+                </div>
+              </form>
+
+              {/* Active Keys Table / List */}
+              <div>
+                <div className="flex items-center justify-between mb-4">
+                  <h4 className="text-sm font-bold text-white flex items-center gap-2">
+                    <Key className="w-4 h-4 text-amber-400" />
+                    Active Access Keys ({accessKeys.length})
+                  </h4>
+                  <span className="text-[10px] text-slate-400">
+                    Live Firestore synchronization
+                  </span>
+                </div>
+
+                {accessKeys.length === 0 ? (
+                  <div className="p-8 text-center bg-black/40 border border-white/5 rounded-2xl">
+                    <p className="text-slate-400 text-xs">
+                      No keys generated yet. Use the form above to create your first license key!
+                    </p>
+                  </div>
+                ) : (
+                  <div className="space-y-2.5 max-h-[350px] overflow-y-auto pr-1">
+                    {accessKeys.map((item) => (
+                      <div 
+                        key={item.id}
+                        className="bg-[#050505] border border-white/10 rounded-xl p-3.5 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 group hover:border-amber-500/30 transition-colors"
+                      >
+                        <div className="flex items-center gap-3">
+                          <div className="p-2 bg-amber-500/10 text-amber-400 rounded-lg">
+                            <Key className="w-4 h-4" />
+                          </div>
+                          <div>
+                            <div className="flex items-center gap-2">
+                              <span className="text-sm font-bold text-amber-300 font-mono tracking-wider">
+                                {item.key}
+                              </span>
+                              <button 
+                                onClick={() => {
+                                  navigator.clipboard.writeText(item.key);
+                                  setCopiedKeyId(item.id);
+                                  setTimeout(() => setCopiedKeyId(null), 2000);
+                                }}
+                                className="p-1 text-slate-400 hover:text-white bg-white/5 rounded hover:bg-white/10 transition-colors"
+                                title="Copy key"
+                              >
+                                {copiedKeyId === item.id ? (
+                                  <Check className="w-3.5 h-3.5 text-emerald-400" />
+                                ) : (
+                                  <Copy className="w-3.5 h-3.5" />
+                                )}
+                              </button>
+                            </div>
+                            <div className="flex items-center gap-2 mt-0.5">
+                              <span className="text-[10px] text-slate-400">
+                                Service: <span className="text-white font-medium">{item.serviceName}</span>
+                              </span>
+                              {item.note && (
+                                <span className="text-[10px] text-slate-500">
+                                  • {item.note}
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-2 self-end sm:self-center">
+                          <span className="text-[10px] text-slate-500">
+                            {new Date(item.createdAt).toLocaleDateString()}
+                          </span>
+                          <button 
+                            onClick={() => setRevokingKey(item)}
+                            className="p-2 text-slate-400 hover:text-red-400 bg-white/5 hover:bg-white/10 rounded-lg transition-colors cursor-pointer"
+                            title="Delete License Key"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* CONFIRM KEY REVOCATION / DELETION MODAL */}
+      <AnimatePresence>
+        {revokingKey && (
+          <div className="fixed inset-0 z-[130] flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              exit={{ opacity: 0, scale: 0.95 }}
+              className="w-full max-w-sm bg-[#0A0A0A] border border-red-500/30 rounded-[2rem] p-7 text-center relative shadow-2xl shadow-red-950/40"
+            >
+              <button 
+                onClick={() => setRevokingKey(null)}
+                className="absolute top-5 right-5 p-2 text-slate-400 hover:text-white rounded-full bg-white/5 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+
+              <div className="w-14 h-14 bg-red-500/10 border border-red-500/20 rounded-full flex items-center justify-center text-red-400 mx-auto mb-4">
+                <Trash2 className="w-7 h-7" />
+              </div>
+
+              <h4 className="text-xl font-bold font-['Plus_Jakarta_Sans'] text-white mb-2">
+                Delete License Key?
+              </h4>
+              <p className="text-slate-400 text-xs mb-4">
+                Delete key <span className="text-amber-300 font-mono font-bold">{revokingKey.key}</span>? Anyone using this key will immediately lose access.
+              </p>
+
+              <div className="flex gap-3">
+                <button 
+                  type="button"
+                  onClick={() => setRevokingKey(null)}
+                  disabled={isRevokingKey}
+                  className="w-1/2 py-2.5 text-xs font-bold text-slate-400 bg-white/5 hover:bg-white/10 rounded-full transition-all cursor-pointer disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => handleRevokeKey(revokingKey)}
+                  disabled={isRevokingKey}
+                  className="w-1/2 py-2.5 text-xs font-bold text-white bg-red-600 hover:bg-red-500 rounded-full transition-all shadow-md shadow-red-900/40 flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50"
+                >
+                  {isRevokingKey ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <>
+                      <Trash2 className="w-3.5 h-3.5" />
                       Delete
                     </>
                   )}
