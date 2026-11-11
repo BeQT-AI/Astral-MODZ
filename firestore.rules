@@ -12,7 +12,9 @@ service cloud.firestore {
         && data.category is string && data.category.size() <= 50
         && data.downloadUrl is string && data.downloadUrl.size() <= 500
         && data.priceType is string && data.priceType.size() <= 20
-        && data.createdAt is number;
+        && data.createdAt is number
+        && (!('licenseKey' in data) || data.licenseKey == null || (data.licenseKey is string && data.licenseKey.size() <= 100))
+        && (!('keyRequired' in data) || data.keyRequired is bool);
     }
 
     // Products collection for Astral MODZ store

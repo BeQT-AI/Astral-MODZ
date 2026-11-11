@@ -5,7 +5,11 @@ import {
   doc, 
   setDoc, 
   deleteDoc, 
-  onSnapshot 
+  onSnapshot,
+  getDocs,
+  query,
+  where,
+  limit
 } from 'firebase/firestore';
 import { db, handleFirestoreError, OperationType } from './firebase';
 import { EMBEDDED_ASTRAL_LOGO, EMBEDDED_ASTRAL_BG } from './assetsData';
@@ -570,7 +574,7 @@ export default function App() {
   const handleValidateAndUnlockKey = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!keyPromptProduct) return;
-    const cleanKey = enteredKey.trim().toUpperCase();
+    const cleanKey = enteredKey.trim();
     if (!cleanKey) {
       setKeyError('Please enter a valid license key.');
       return;
@@ -582,25 +586,74 @@ export default function App() {
     try {
       let isMatch = false;
 
-      // 1. Check if matches the direct product.licenseKey
-      if (keyPromptProduct.licenseKey && keyPromptProduct.licenseKey.trim().toUpperCase() === cleanKey) {
+      // 1. Check if matches the direct product.licenseKey (case-insensitive, trimmed)
+      if (
+        keyPromptProduct.licenseKey && 
+        keyPromptProduct.licenseKey.trim().toUpperCase() === cleanKey.toUpperCase()
+      ) {
         isMatch = true;
       }
 
-      // 2. Check if key exists in active access_keys in Firestore
+      // 2. Query Firestore collection 'access_keys' directly for this key
       if (!isMatch) {
-        const found = accessKeys.find(k => 
-          k.key.trim().toUpperCase() === cleanKey && 
-          k.status === 'active' && 
-          (k.serviceId === 'all' || k.serviceId === keyPromptProduct.id)
-        );
-        if (found) {
-          isMatch = true;
+        try {
+          const keysRef = collection(db, 'access_keys');
+          // Query for exact key or case-insensitive search
+          const q = query(keysRef, where('key', '==', cleanKey), limit(5));
+          const snapshot = await getDocs(q);
+
+          if (!snapshot.empty) {
+            snapshot.forEach((docSnap) => {
+              const data = docSnap.data();
+              if (
+                data.status === 'active' && 
+                (data.serviceId === 'all' || data.serviceId === keyPromptProduct.id)
+              ) {
+                isMatch = true;
+              }
+            });
+          }
+
+          // If not found with exact case, check uppercase variation
+          if (!isMatch && cleanKey.toUpperCase() !== cleanKey) {
+            const qUpper = query(keysRef, where('key', '==', cleanKey.toUpperCase()), limit(5));
+            const snapUpper = await getDocs(qUpper);
+            if (!snapUpper.empty) {
+              snapUpper.forEach((docSnap) => {
+                const data = docSnap.data();
+                if (
+                  data.status === 'active' && 
+                  (data.serviceId === 'all' || data.serviceId === keyPromptProduct.id)
+                ) {
+                  isMatch = true;
+                }
+              });
+            }
+          }
+
+          // Also check local accessKeys if available in memory (e.g. for admin session)
+          if (!isMatch && accessKeys.length > 0) {
+            const foundLocal = accessKeys.find(k => 
+              k.key.trim().toUpperCase() === cleanKey.toUpperCase() && 
+              k.status === 'active' && 
+              (k.serviceId === 'all' || k.serviceId === keyPromptProduct.id)
+            );
+            if (foundLocal) isMatch = true;
+          }
+        } catch (queryErr) {
+          console.warn('Firestore key query fallback check:', queryErr);
+          // If query fails, fall back to check against local accessKeys
+          const found = accessKeys.find(k => 
+            k.key.trim().toUpperCase() === cleanKey.toUpperCase() && 
+            k.status === 'active' && 
+            (k.serviceId === 'all' || k.serviceId === keyPromptProduct.id)
+          );
+          if (found) isMatch = true;
         }
       }
 
       if (isMatch) {
-        // Unlock this service for user
+        // Unlock this service for user and persist in local storage
         const newUnlocked = Array.from(new Set([...unlockedProductIds, keyPromptProduct.id]));
         setUnlockedProductIds(newUnlocked);
         try {
@@ -612,6 +665,7 @@ export default function App() {
         const unlockedProduct = keyPromptProduct;
         setKeyPromptProduct(null);
         setEnteredKey('');
+        setKeyError('');
         // Trigger auto download
         triggerAutoDownload(unlockedProduct);
       } else {
